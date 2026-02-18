@@ -12,5 +12,10 @@ A solução foi estruturada seguindo princípios de arquitetura moderna de dados
 
 - **Apache Airflow** – Orquestração e agendamento de pipelines  
 - **Polars** – Transformações batch de alta performance  
-- **MinIO** – Object Storage compatível com S3  
+- **MinIO** – Object Storage compatível com S3 (Data Lake)  
+- **DuckDB** – Data Warehouse analítico para consultas SQL e camada Gold  
 - **Docker** – Containerização e isolamento da infraestrutura  
+ 
+
+<img width="736" height="356" alt="health2 drawio" src="https://github.com/user-attachments/assets/16bbfe8c-7f28-49ea-b963-93a2b6e761b7" />
+
