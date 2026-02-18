@@ -9,6 +9,8 @@ from airflow.sdk.definitions.decorators import dag, task_group
 
 from minio.error import S3Error
 from minio import Minio
+from minio.commonconfig import CopySource
+
 
 import polars as pl
 from polars import DataFrame
@@ -31,6 +33,7 @@ class MinioETL:
         self.access_key = access_key
         self.secret_key = secret_key
         self.endpoint = endpoint
+
     @staticmethod
     def hash_row(row):
         row_str = "|".join([str(v) if v is not None else "" for v in row])
@@ -49,9 +52,38 @@ class MinioETL:
         )
         return df
 
+    def move_processed_file(self, filename):
+        destination_bucket = self.bucket
+        destination_object = f"{folder}/processed_data/{filename.replace(f'{folder}/', '')}"
+
+        source_bucket = self.bucket
+        source_object = f"{filename}.csv"
+
+        client = self.client
+
+        try:
+            client.copy_object(
+                bucket_name=destination_bucket,
+                object_name=destination_object,
+                source=CopySource(source_bucket, source_object)
+            )
+
+            print(f"Copied '{source_object}' to '{destination_object}'.")
+
+            client.remove_object(source_bucket, source_object)
+
+            print("Object moved successfully.")
+
+        except S3Error as e:
+            print(f"Error moving object: {e}")
+            raise e
+
     def save_data(self, df: DataFrame, filename: str):
-        path = f"s3://{self.bucket}/healthcare_data_driven/bronze/{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        filename_no_data = filename
+        filename = f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        path = f"s3://{self.bucket}/healthcare_data_driven/bronze/{filename}"
         print(f"Saving data to {path}...")
+
         df.write_parquet(
             path,
             partition_by="batch_id",
@@ -64,11 +96,15 @@ class MinioETL:
             }
         )
 
+        self.move_processed_file(filename_no_data)
+
     def extract_data(self, file_name: str) -> None:
         global res
         try:
-            objects = self.client.list_objects(self.bucket, prefix=f"{folder}/{file_name}", recursive=True)
-            files = [obj.object_name for obj in objects if obj.object_name.endswith(".csv")]
+            objects = self.client.list_objects(
+                self.bucket, prefix=f"{folder}/{file_name}", recursive=True)
+            files = [
+                obj.object_name for obj in objects if obj.object_name.endswith(".csv")]
 
             if not files:
                 print("Nenhum arquivo encontrado.")
@@ -86,6 +122,7 @@ class MinioETL:
         except S3Error as e:
             if "NoSuchKey" in str(e):
                 print("Arquivo não encontrado, skipping.")
+                raise e
             else:
                 raise e
         finally:
@@ -117,7 +154,6 @@ def healthcare_etl():
         secure=False
     )
 
-
     @task_group(group_id="connection_check")
     def connection_check():
 
@@ -139,7 +175,6 @@ def healthcare_etl():
         )
 
         conn_check >> wait_for_file
-
 
     @task_group(group_id="healthcare_etl")
     def bronze_etl():
