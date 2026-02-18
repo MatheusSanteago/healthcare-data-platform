@@ -1,0 +1,171 @@
+from io import BytesIO
+import hashlib
+from datetime import datetime
+
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook
+from airflow.sdk.definitions.decorators import dag, task_group
+
+from minio.error import S3Error
+from minio import Minio
+
+import polars as pl
+from polars import DataFrame
+
+
+conn = BaseHook.get_connection("my_s3_conn")
+folder = "healthcare"
+
+
+class MinioETL:
+    def __init__(self, endpoint, access_key, secret_key, secure=False, bucket="datalake"):
+        self.client = Minio(
+            endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure
+        )
+
+        self.bucket = bucket
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.endpoint = endpoint
+    @staticmethod
+    def hash_row(row):
+        row_str = "|".join([str(v) if v is not None else "" for v in row])
+        return hashlib.sha256(row_str.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def add_metadata_columns(df: DataFrame, filename: str) -> DataFrame:
+        batch_id = f"{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        df = df.with_columns(
+            pl.lit(datetime.now()).alias("ingestion_timestamp"),
+            pl.lit(filename).alias("source_file"),
+            pl.lit(batch_id).alias("batch_id"),
+            pl.struct([c for c in df.columns])
+              .map_elements(lambda x: MinioETL.hash_row(list(x.values())))
+              .alias("_record_hash")
+        )
+        return df
+
+    def save_data(self, df: DataFrame, filename: str):
+        path = f"s3://{self.bucket}/healthcare_data_driven/bronze/{filename}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        print(f"Saving data to {path}...")
+        df.write_parquet(
+            path,
+            partition_by="batch_id",
+            compression="snappy",
+            storage_options={
+                "aws_access_key_id": self.access_key,
+                "aws_secret_access_key": self.secret_key,
+                "aws_endpoint_url": f"http://{self.endpoint}",
+                "aws_region": "us-east-1"
+            }
+        )
+
+    def extract_data(self, file_name: str) -> None:
+        global res
+        try:
+            objects = self.client.list_objects(self.bucket, prefix=f"{folder}/{file_name}", recursive=True)
+            files = [obj.object_name for obj in objects if obj.object_name.endswith(".csv")]
+
+            if not files:
+                print("Nenhum arquivo encontrado.")
+
+            for file in files:
+                print(f"Lendo arquivo: {file}")
+                filename = file.replace(".csv", "")
+
+                res = self.client.get_object(self.bucket, file)
+                data = res.read()
+                df = pl.read_csv(BytesIO(data))
+                df_final = self.add_metadata_columns(df, filename)
+                self.save_data(df_final, filename)
+
+        except S3Error as e:
+            if "NoSuchKey" in str(e):
+                print("Arquivo não encontrado, skipping.")
+            else:
+                raise e
+        finally:
+            try:
+                res.close()
+                res.release_conn()
+            except Exception as e:
+                print(e)
+
+
+def conn_test(client):
+    print("Connected to minio")
+    for bucket in client.list_buckets():
+        print(bucket.name)
+
+
+@dag(
+    dag_id="file_spy",
+    schedule="@daily",
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+)
+def healthcare_etl():
+
+    etl = MinioETL(
+        endpoint="host.docker.internal:9000",
+        access_key=conn.login,
+        secret_key=conn.password,
+        secure=False
+    )
+
+
+    @task_group(group_id="connection_check")
+    def connection_check():
+
+        conn_check = PythonOperator(
+            task_id="conn_test",
+            python_callable=conn_test,
+            op_kwargs={"client": etl.client}
+        )
+
+        wait_for_file = S3KeySensor(
+            task_id="s3_file_check",
+            bucket_name="datalake",
+            bucket_key="healthcare/*",
+            wildcard_match=True,
+            aws_conn_id="my_s3_conn",
+            poke_interval=10,
+            timeout=180,
+            mode="reschedule",
+        )
+
+        conn_check >> wait_for_file
+
+
+    @task_group(group_id="healthcare_etl")
+    def bronze_etl():
+
+        appointments = PythonOperator(
+            task_id="appointments_bronze",
+            python_callable=etl.extract_data,
+            op_kwargs={
+                "file_name": "appointments",
+            }
+        )
+
+        diagnoses = PythonOperator(
+            task_id="diagnoses_bronze",
+            python_callable=etl.extract_data,
+            op_kwargs={
+                "file_name": "diagnoses",
+            }
+        )
+
+        appointments >> diagnoses
+
+    conn_validator = connection_check()
+    bronze_ingestion = bronze_etl()
+
+    conn_validator >> bronze_ingestion
+
+
+healthcare_etl()
