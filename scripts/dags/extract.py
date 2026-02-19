@@ -140,30 +140,50 @@ def conn_test(client):
 
 
 @dag(
-    dag_id="file_spy",
+    dag_id="healthcare_ingestion",
     schedule="@daily",
-    start_date=datetime(2026, 1, 1),
+    start_date=datetime(2026, 2, 1),
     catchup=False,
 )
 def healthcare_etl():
+    files = [
+        "specialties",
+        "providers",
+        "payments",
+        "patients",
+        "medications",
+        "medical_records",
+        "lab_test_types",
+        "lab_orders",
+        "insurance_policies",
+        "insurance_companies",
+        "icd10_codes",
+        "facilities",
+        "departments",
+        "cpt_codes",
+        "claims",
+        "claim_line_items",
+        "appointments",
+        "diagnoses"
+    ]
 
-    etl = MinioETL(
+    conn_minio = MinioETL(
         endpoint="host.docker.internal:9000",
         access_key=conn.login,
         secret_key=conn.password,
         secure=False
     )
 
-    @task_group(group_id="connection_check")
-    def connection_check():
+    @task_group(group_id="connection_status")
+    def conn_status():
 
-        conn_check = PythonOperator(
+        conn_staus_report = PythonOperator(
             task_id="conn_test",
             python_callable=conn_test,
-            op_kwargs={"client": etl.client}
+            op_kwargs={"client": conn_minio.client}
         )
 
-        wait_for_file = S3KeySensor(
+        check_if_file_exists = S3KeySensor(
             task_id="s3_file_check",
             bucket_name="datalake",
             bucket_key="healthcare/*",
@@ -174,33 +194,21 @@ def healthcare_etl():
             mode="reschedule",
         )
 
-        conn_check >> wait_for_file
+        conn_staus_report >> check_if_file_exists
 
     @task_group(group_id="healthcare_etl")
     def bronze_etl():
+        bronze_extraction_jobs = PythonOperator.partial(
+            task_id="bronze_ingestion",
+            python_callable=conn_minio.extract_data,
+        ).expand(op_kwargs=[{"file_name": f} for f in files])
 
-        appointments = PythonOperator(
-            task_id="appointments_bronze",
-            python_callable=etl.extract_data,
-            op_kwargs={
-                "file_name": "appointments",
-            }
-        )
+        bronze_extraction_jobs
 
-        diagnoses = PythonOperator(
-            task_id="diagnoses_bronze",
-            python_callable=etl.extract_data,
-            op_kwargs={
-                "file_name": "diagnoses",
-            }
-        )
+    f_conn_check = conn_status()
+    f_bronze_ingestion = bronze_etl()
 
-        appointments >> diagnoses
-
-    conn_validator = connection_check()
-    bronze_ingestion = bronze_etl()
-
-    conn_validator >> bronze_ingestion
+    f_conn_check >> f_bronze_ingestion
 
 
 healthcare_etl()
